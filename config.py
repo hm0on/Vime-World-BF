@@ -6,8 +6,8 @@ PARAM2_NAME = "password"
 EXTRA_JSON = {}  # Дополнительные постоянные параметры тела запроса.
 HEADERS = {"Refer": "https://cp.vimeworld.com/login"}
 
-FIRST_FILE = "1.txt"
-SECOND_FILE = "2.txt"
+FIRST_FILE = "users.txt"
+SECOND_FILE = "passwords.txt"
 PROXY_FILE = "proxys.txt"
 DATABASE_FILE = "results.sqlite3"
 MATCHES_FILE = "matches.jsonl"
