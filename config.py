@@ -20,12 +20,11 @@ NO_MATCH_JSON = {"success": True}
 RESPONSE_MATCH_MODE = "subset"  # "subset" или "exact"
 
 REQUESTS_PER_PROXY = 5
-CONCURRENCY = 20  # Общий лимит запросов одновременно, независимо от размера группы.
+CONCURRENCY = 50  # Общий лимит запросов одновременно, независимо от размера группы.
 TIMEOUT_SECONDS = 15.0  # Максимальное время всей попытки, включая тело ответа.
 MAX_RESPONSE_BYTES = 1_048_576
 VERIFY_TLS = True
-USE_PROXIES = False  # False удобно для локального тестирования.
-
+USE_PROXIES = True  # False удобно для локального тестирования.
 # Измените, чтобы намеренно проверить все пары заново.
 # Адрес, имена параметров, EXTRA_JSON и правила ответа также разделяют историю.
 RUN_NAMESPACE = "default"
