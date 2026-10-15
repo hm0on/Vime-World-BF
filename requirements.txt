@@ -1,0 +1,4 @@
+httpx[socks]==0.28.1
+httpx-socks[asyncio]==0.13.0
+loguru>=0.7.3,<0.8
+rich>=14.1,<15
