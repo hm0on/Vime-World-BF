@@ -12,6 +12,10 @@ PROXY_FILE = "proxys.txt"
 DATABASE_FILE = "results.sqlite3"
 MATCHES_FILE = "matches.jsonl"
 
+# Определение результата: "status" — HTTP-код, "json" — содержимое JSON.
+RESULT_MODE = "status"
+
+# Настройки ниже применяются только в режиме RESULT_MODE = "json".
 # Сравнение по указанным ключам: лишние поля ответа игнорируются.
 # Например, {"result": {"valid": True}} проверит вложенный ключ.
 # Для полного сравнения JSON установите RESPONSE_MATCH_MODE = "exact".
@@ -20,7 +24,7 @@ NO_MATCH_JSON = {"success": True}
 RESPONSE_MATCH_MODE = "subset"  # "subset" или "exact"
 
 REQUESTS_PER_PROXY = 5
-CONCURRENCY = 50  # Общий лимит запросов одновременно, независимо от размера группы.
+CONCURRENCY = 10  # Общий лимит запросов одновременно, независимо от размера группы.
 TIMEOUT_SECONDS = 15.0  # Максимальное время всей попытки, включая тело ответа.
 MAX_RESPONSE_BYTES = 1_048_576
 VERIFY_TLS = True

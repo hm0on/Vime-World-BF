@@ -23,6 +23,7 @@ class TestConfig:
             SECOND_FILE="2.txt", PROXY_FILE="proxys.txt", DATABASE_FILE="results.sqlite3",
             MATCHES_FILE="matches.jsonl", MATCH_JSON={"match": True},
             NO_MATCH_JSON={"match": False}, RESPONSE_MATCH_MODE="subset",
+            RESULT_MODE="status",
             CONCURRENCY=5, REQUESTS_PER_PROXY=5, TIMEOUT_SECONDS=3,
             MAX_RESPONSE_BYTES=1048576, VERIFY_TLS=True, USE_PROXIES=True,
             RUN_NAMESPACE="test", RETRY_ERRORS_ON_NEXT_RUN=False,
@@ -36,6 +37,56 @@ class TestConfig:
 
 
 class CheckerTests(TestConfig, unittest.TestCase):
+    def test_result_modes_have_separate_history(self):
+        status_profile = main.profile_id()
+        with patch.object(config, "MATCH_JSON", {"different": True}):
+            self.assertEqual(status_profile, main.profile_id())
+        with patch.object(config, "RESULT_MODE", "json"):
+            json_profile = main.profile_id()
+            self.assertNotEqual(status_profile, json_profile)
+            with patch.object(config, "MATCH_JSON", {"different": True}):
+                self.assertNotEqual(json_profile, main.profile_id())
+        self.assertEqual(status_profile, main.profile_id())
+
+    def test_json_mode_handles_rules_errors_and_rate_limit(self):
+        cases = [
+            (200, {"match": True, "extra": 1}, "match"),
+            (200, {"match": False}, "no_match"),
+            (400, {"match": False}, "no_match"),
+            (200, {"match": 1}, "unknown"),
+            (200, {"other": True}, "unknown"),
+            (429, {"match": True}, "rate_limited"),
+            (503, {"match": True}, "http_error"),
+            (200, None, "response_error"),
+        ]
+
+        async def exercise(storage):
+            for index, (code, data, expected) in enumerate(cases):
+                response = httpx.Response(code, text="not json") if data is None else httpx.Response(code, json=data)
+                async with httpx.AsyncClient(transport=httpx.MockTransport(lambda request: response)) as client:
+                    counts = Counter()
+                    await main.check_pair(client, asyncio.Semaphore(1), storage, ("one", str(index)), counts)
+                    self.assertEqual(dict(counts), {expected: 1})
+
+        with tempfile.TemporaryDirectory() as directory, patch.object(main, "BASE", Path(directory)), \
+                patch.object(config, "RESULT_MODE", "json"):
+            storage = main.Storage()
+            try:
+                asyncio.run(exercise(storage))
+            finally:
+                storage.close()
+
+    def test_json_subset_exact_and_ambiguous_rules(self):
+        data = {"result": {"ok": True, "extra": 7}}
+        with patch.multiple(config, MATCH_JSON={"result": {"ok": True}},
+                            NO_MATCH_JSON={"result": {"ok": False}}):
+            self.assertEqual(main.classify_json(data), "match")
+            with patch.object(config, "RESPONSE_MATCH_MODE", "exact"):
+                self.assertEqual(main.classify_json(data), "unknown")
+        with patch.multiple(config, MATCH_JSON={"a": True}, NO_MATCH_JSON={"b": True}):
+            self.assertEqual(main.classify_json({"a": True, "b": True}), "unknown")
+        self.assertFalse(main.json_matches([1], [True]))
+
     def test_rolling_queue_does_not_wait_for_slowest_in_group(self):
         with tempfile.TemporaryDirectory() as directory:
             base = Path(directory)
@@ -103,17 +154,12 @@ class CheckerTests(TestConfig, unittest.TestCase):
             with patch.object(config, "USE_PROXIES", True):
                 self.assertEqual(main.read_proxies(), [*values[:2], "http://localhost:9003", values[3]])
 
-    def test_rules_are_nested_and_type_sensitive(self):
-        with patch.multiple(config, RESPONSE_MATCH_MODE="subset",
-                            MATCH_JSON={"result": {"ok": True}},
-                            NO_MATCH_JSON={"result": {"ok": False}}):
-            self.assertEqual(main.classify({"result": {"ok": True, "id": 7}}), "match")
-            self.assertEqual(main.classify({"result": {"ok": False}}), "no_match")
-            self.assertEqual(main.classify({"result": {"ok": 1}}), "unknown")
-            self.assertEqual(main.classify({"message": "wait"}), "unknown")
-        with patch.multiple(config, RESPONSE_MATCH_MODE="exact"):
-            self.assertFalse(main.json_matches({"ok": True, "extra": 1}, {"ok": True}))
-            self.assertFalse(main.json_matches([1], [True]))
+    def test_http_status_classification(self):
+        for code, status in [(200, "match"), (400, "no_match"), (429, "rate_limited"),
+                             (201, "http_error"), (204, "http_error"), (302, "http_error"),
+                             (401, "http_error"), (503, "http_error")]:
+            with self.subTest(code=code):
+                self.assertEqual(main.classify_status(code), status)
 
     def test_cartesian_dedup_rotation_resume_and_export(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -134,7 +180,7 @@ class CheckerTests(TestConfig, unittest.TestCase):
                 routes[tuple(payload.values())] = proxy
                 calls.append(payload)
                 active -= 1
-                return httpx.Response(200, json={"match": payload["param1"] == payload["param2"]})
+                return httpx.Response(200 if payload["param1"] == payload["param2"] else 400)
 
             def factory(**kwargs):
                 proxy = kwargs.pop("proxy")
@@ -159,7 +205,7 @@ class CheckerTests(TestConfig, unittest.TestCase):
                 asyncio.run(main.run())
                 self.assertEqual(len(calls), 8)
 
-    def test_network_http_unknown_and_invalid_json_are_not_matches(self):
+    def test_status_overrides_body_and_errors_are_not_matches(self):
         with tempfile.TemporaryDirectory() as directory, patch.object(main, "BASE", Path(directory)):
             storage = main.Storage()
 
@@ -173,24 +219,34 @@ class CheckerTests(TestConfig, unittest.TestCase):
                     return httpx.Response(503, json={"match": True})
                 if value == "invalid":
                     return httpx.Response(200, text="not json")
-                return httpx.Response(200, json={"unexpected": True})
+                if value == "no_match":
+                    return httpx.Response(400, json={"match": True})
+                if value == "limited":
+                    return httpx.Response(429, json={"match": True})
+                if value == "created":
+                    return httpx.Response(201, json={"match": True})
+                return httpx.Response(200, json={"match": False})
 
             async def exercise():
                 async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
                     counts = Counter()
-                    for value in ["network", "socks", "http", "invalid", "unknown"]:
+                    for value in ["network", "socks", "http", "invalid", "empty_rule", "no_match", "limited", "created"]:
                         await main.check_pair(client, asyncio.Semaphore(5), storage, ("1", value), counts)
                     return counts
 
             try:
                 counts = asyncio.run(exercise())
-                self.assertEqual(dict(counts), {"network_error": 2, "http_error": 1,
-                                                "response_error": 1, "unknown": 1})
+                self.assertEqual(dict(counts), {"network_error": 2, "http_error": 2,
+                                                "match": 2, "no_match": 1, "rate_limited": 1})
                 self.assertTrue(storage.completed("1", "network"))
                 with patch.object(config, "RETRY_ERRORS_ON_NEXT_RUN", True):
                     self.assertFalse(storage.completed("1", "network"))
+                    self.assertFalse(storage.completed("1", "limited"))
+                    self.assertTrue(storage.completed("1", "no_match"))
                 storage.export_matches()
-                self.assertEqual((Path(directory) / config.MATCHES_FILE).read_text(), "")
+                exported = [json.loads(line)["param2"] for line in
+                            (Path(directory) / config.MATCHES_FILE).read_text().splitlines()]
+                self.assertEqual(set(exported), {"invalid", "empty_rule"})
             finally:
                 storage.close()
 

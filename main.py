@@ -125,38 +125,58 @@ class ClientPool:
         self.entries.clear()
 
 
+def classify_status(code):
+    if code == 200:
+        return "match"
+    if code == 400:
+        return "no_match"
+    if code == 429:
+        return "rate_limited"
+    return "http_error"
+
+
 def json_matches(actual, expected):
-    if cfg.RESPONSE_MATCH_MODE == "subset" and isinstance(expected, dict):
-        return isinstance(actual, dict) and all(
-            key in actual and json_matches(actual[key], value)
-            for key, value in expected.items()
-        )
-    # JSON true и 1 должны различаться, в том числе внутри списков.
     if type(actual) is not type(expected):
         return False
     if isinstance(expected, dict):
-        return actual.keys() == expected.keys() and all(
-            json_matches(actual[key], value) for key, value in expected.items()
-        )
+        if cfg.RESPONSE_MATCH_MODE == "exact" and actual.keys() != expected.keys():
+            return False
+        return all(key in actual and json_matches(actual[key], value)
+                   for key, value in expected.items())
     if isinstance(expected, list):
         return len(actual) == len(expected) and all(
-            json_matches(a, b) for a, b in zip(actual, expected)
-        )
+            json_matches(a, b) for a, b in zip(actual, expected))
     return actual == expected
 
 
-def classify(data):
+def classify_json(data):
     match = json_matches(data, cfg.MATCH_JSON)
     no_match = json_matches(data, cfg.NO_MATCH_JSON)
     if match == no_match:
-        return "unknown"  # Ни одно правило или сразу оба: это не успех.
+        return "unknown"
     return "match" if match else "no_match"
 
 
+async def read_json_result(response):
+    body = bytearray()
+    async for chunk in response.aiter_bytes():
+        body.extend(chunk)
+        if len(body) > cfg.MAX_RESPONSE_BYTES:
+            return "response_error", "Превышен MAX_RESPONSE_BYTES"
+    try:
+        data = json.loads(body)
+    except (ValueError, UnicodeDecodeError):
+        return "response_error", "Ответ не является JSON"
+    return classify_json(data), json.dumps(data, ensure_ascii=False)
+
+
 def profile_id():
-    settings = [cfg.RUN_NAMESPACE, cfg.API_URL, cfg.PARAM1_NAME,
-                cfg.PARAM2_NAME, cfg.EXTRA_JSON, cfg.HEADERS,
-                cfg.MATCH_JSON, cfg.NO_MATCH_JSON, cfg.RESPONSE_MATCH_MODE]
+    # Профиль режима status сохраняется для совместимости с имеющейся историей.
+    settings = ["http-status-v1", cfg.RUN_NAMESPACE, cfg.API_URL, cfg.PARAM1_NAME,
+                cfg.PARAM2_NAME, cfg.EXTRA_JSON, cfg.HEADERS]
+    if cfg.RESULT_MODE == "json":
+        settings[0] = "json-response-v1"
+        settings.extend([cfg.MATCH_JSON, cfg.NO_MATCH_JSON, cfg.RESPONSE_MATCH_MODE])
     return hashlib.sha256(json.dumps(
         settings, sort_keys=True, ensure_ascii=False
     ).encode()).hexdigest()
@@ -233,24 +253,12 @@ async def check_pair(client, semaphore, storage, pair, counts, dashboard=None):
             async with asyncio.timeout(cfg.TIMEOUT_SECONDS):
                 async with client.stream("POST", cfg.API_URL, json=payload) as response:
                     code = response.status_code
-                    if not 200 <= code < 300:
-                        status, detail = "http_error", f"HTTP {code}"
-                    else:
-                        body = bytearray()
-                        async for chunk in response.aiter_bytes():
-                            body.extend(chunk)
-                            if len(body) > cfg.MAX_RESPONSE_BYTES:
-                                break
-                        if len(body) > cfg.MAX_RESPONSE_BYTES:
-                            status, detail = "response_error", "Превышен MAX_RESPONSE_BYTES"
-                        else:
-                            try:
-                                data = json.loads(body)
-                            except (ValueError, UnicodeDecodeError):
-                                status, detail = "response_error", "Ответ не является JSON"
-                            else:
-                                status = classify(data)
-                                detail = json.dumps(data, ensure_ascii=False)
+                    status, detail = classify_status(code), f"HTTP {code}"
+                    if code == 429:
+                        detail = "HTTP 429: сервер ограничил частоту запросов"
+                        logger.warning("HTTP 429: слишком много запросов. Уменьшите CONCURRENCY.")
+                    elif cfg.RESULT_MODE == "json" and (200 <= code < 300 or 400 <= code < 500):
+                        status, detail = await read_json_result(response)
         except (httpx.RequestError, ProxyConnectionError, ProxyError, TimeoutError) as exc:
             # Не включаем текст исключения: он может содержать пароль прокси.
             status, detail = "network_error", type(exc).__name__
@@ -263,7 +271,7 @@ async def check_pair(client, semaphore, storage, pair, counts, dashboard=None):
         pair_id = hashlib.sha256(json.dumps(pair, ensure_ascii=False).encode()).hexdigest()[:12]
         logger.debug("pair={} status={} http={} elapsed={:.0f}ms reason={}",
                      pair_id, status, code or "—", elapsed * 1000,
-                     detail if status in {"network_error", "http_error", "response_error"} else "—")
+                     detail if status in {"network_error", "http_error", "rate_limited", "response_error"} else "—")
 
 
 def validate_settings():
@@ -278,12 +286,17 @@ def validate_settings():
         raise ValueError("CONCURRENCY, REQUESTS_PER_PROXY и MAX_CACHED_CLIENTS должны быть >= 1.")
     if cfg.UI_REFRESH_PER_SECOND <= 0:
         raise ValueError("UI_REFRESH_PER_SECOND должен быть положительным.")
-    if cfg.TIMEOUT_SECONDS <= 0 or cfg.MAX_RESPONSE_BYTES < 1:
-        raise ValueError("Таймаут и лимит ответа должны быть положительными.")
-    if cfg.RESPONSE_MATCH_MODE not in {"subset", "exact"}:
-        raise ValueError("RESPONSE_MATCH_MODE: subset или exact.")
-    if cfg.MATCH_JSON == cfg.NO_MATCH_JSON:
-        raise ValueError("MATCH_JSON и NO_MATCH_JSON должны различаться.")
+    if cfg.TIMEOUT_SECONDS <= 0:
+        raise ValueError("Таймаут должен быть положительным.")
+    if cfg.RESULT_MODE not in {"json", "status"}:
+        raise ValueError("RESULT_MODE: json или status.")
+    if cfg.RESULT_MODE == "json":
+        if cfg.RESPONSE_MATCH_MODE not in {"subset", "exact"}:
+            raise ValueError("RESPONSE_MATCH_MODE: subset или exact.")
+        if cfg.MAX_RESPONSE_BYTES < 1:
+            raise ValueError("MAX_RESPONSE_BYTES должен быть положительным.")
+        if cfg.MATCH_JSON == cfg.NO_MATCH_JSON:
+            raise ValueError("MATCH_JSON и NO_MATCH_JSON должны различаться.")
 
 
 def pending_pairs(first_values, second_values, storage, dashboard):
